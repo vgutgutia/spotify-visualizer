@@ -5,10 +5,12 @@ import argparse
 import curses
 import io
 import os
+import random
 import sys
 import threading
 import time
 import urllib.request
+from collections import deque
 
 import numpy as np
 import sounddevice as sd
@@ -205,6 +207,9 @@ def compute_bands(audio, samplerate, num_bands):
 # ---------------------------------------------------------------------------
 
 GALAXY_GRADIENT = [39, 51, 87, 129, 135, 171, 213, 255]
+GALAXY_UI_COLORS = [51, 99, 213, 51]  # pairs 10, 11, 12, 13
+PARTICLE_CHARS = ["✦", "·", "*", "+"]
+MODE_NAMES = ["BARS", "MIRROR", "WAVE", "SPECTROGRAM"]
 
 
 def _rgb_to_256(r, g, b):
@@ -213,6 +218,48 @@ def _rgb_to_256(r, g, b):
     gi = round(g / 255 * 5)
     bi = round(b / 255 * 5)
     return 16 + 36 * ri + 6 * gi + bi
+
+
+def _256_to_rgb(idx):
+    """Reverse lookup from xterm-256 index to (r, g, b)."""
+    if 16 <= idx <= 231:
+        idx -= 16
+        r = idx // 36
+        g = (idx // 6) % 6
+        b = idx % 6
+        return (r * 51, g * 51, b * 51)
+    elif 232 <= idx <= 255:
+        v = 8 + (idx - 232) * 10
+        return (v, v, v)
+    basic = [
+        (0, 0, 0), (128, 0, 0), (0, 128, 0), (128, 128, 0),
+        (0, 0, 128), (128, 0, 128), (0, 128, 128), (192, 192, 192),
+        (128, 128, 128), (255, 0, 0), (0, 255, 0), (255, 255, 0),
+        (0, 0, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255),
+    ]
+    if 0 <= idx < 16:
+        return basic[idx]
+    return (128, 128, 128)
+
+
+GALAXY_FULL_RGB = [_256_to_rgb(c) for c in GALAXY_GRADIENT] + \
+                  [_256_to_rgb(c) for c in GALAXY_UI_COLORS]
+
+
+def _lerp_palette(old_rgb, tgt_rgb, t):
+    """Interpolate between two RGB palette lists and apply to curses color pairs."""
+    result = []
+    for (cr, cg, cb), (tr, tg, tb) in zip(old_rgb, tgt_rgb):
+        r = int(cr + (tr - cr) * t)
+        g = int(cg + (tg - cg) * t)
+        b = int(cb + (tb - cb) * t)
+        result.append((r, g, b))
+    for i in range(min(8, len(result))):
+        curses.init_pair(i + 1, _rgb_to_256(*result[i]), -1)
+    ui_pairs = [10, 11, 12, 13]
+    for i in range(min(4, len(result) - 8)):
+        curses.init_pair(ui_pairs[i], _rgb_to_256(*result[8 + i]), -1)
+    return result
 
 
 def extract_palette(img_data, n=8):
@@ -296,12 +343,12 @@ def _safe(stdscr, y, x, text, attr=0):
         pass
 
 
-
 # ---------------------------------------------------------------------------
 # Drawing
 # ---------------------------------------------------------------------------
 
-def _draw_bars(stdscr, bars, num_bands, top, bottom, left, right, bar_height, ce):
+def _draw_bars(stdscr, bars, num_bands, top, bottom, left, right,
+               bar_height, ce, beat_flash=0, peak_heights=None):
     """Draw frequency bars with galaxy gradient + star dissolution."""
     if bar_height < 2:
         return
@@ -369,9 +416,217 @@ def _draw_bars(stdscr, bars, num_bands, top, bottom, left, right, bar_height, ce
                         ch = "█"
 
                 attr = curses.color_pair(pair) if ce else 0
-                if bar_frac >= 0.76:
+                if beat_flash > 0 or bar_frac >= 0.76:
                     attr |= curses.A_BOLD
                 _safe(stdscr, y, cx, ch, attr)
+
+    # Peak hold dots
+    if peak_heights is not None and ce:
+        mid = bar_w // 2
+        for i in range(num_bands):
+            peak_h = int(peak_heights[i] * bar_height)
+            if peak_h > 0:
+                y = bottom - 1 - peak_h
+                if top <= y < bottom:
+                    px = x_off + i * (bar_w + gap) + mid
+                    if px < right:
+                        _safe(stdscr, y, px, "·",
+                              curses.color_pair(8) | curses.A_BOLD)
+
+
+def _draw_mirror(stdscr, bars, num_bands, top, bottom, left, right,
+                 bar_height, ce, beat_flash=0, peak_heights=None):
+    """Draw mirrored bars growing from horizontal center up and down."""
+    if bar_height < 4:
+        return
+
+    total = right - left
+    bar_w = max(1, (total - (num_bands - 1)) // num_bands)
+    gap = 1
+    used = num_bands * bar_w + (num_bands - 1) * gap
+    x_off = left + max(0, (total - used) // 2)
+    mid_w = bar_w // 2
+
+    center_y = (top + bottom) // 2
+    half_height = max((bottom - top) // 2, 1)
+
+    for i in range(num_bands):
+        bar_h = int(bars[i] * half_height)
+        if bar_h < 1 and bars[i] > 0.02:
+            bar_h = 1
+        x = x_off + i * (bar_w + gap)
+
+        for row in range(bar_h):
+            y_up = center_y - 1 - row
+            y_down = center_y + row
+
+            if ce:
+                abs_frac = row / max(half_height - 1, 1)
+                pair = min(int(abs_frac * 8), 7) + 1
+            else:
+                pair = 0
+
+            bar_frac = row / max(bar_h - 1, 1)
+
+            if bar_frac >= 0.90:
+                ch = "✦"
+            elif bar_frac >= 0.76:
+                ch = "░"
+            elif bar_frac >= 0.58:
+                ch = "▒"
+            elif bar_frac >= 0.35:
+                ch = "▓"
+            else:
+                ch = "█"
+
+            attr = curses.color_pair(pair) if ce else 0
+            if beat_flash > 0 or bar_frac >= 0.76:
+                attr |= curses.A_BOLD
+
+            for dx in range(bar_w):
+                cx = x + dx
+                if cx >= right:
+                    break
+                if ch == "✦" and bar_w > 2 and dx != mid_w:
+                    continue
+                if ch == "░" and bar_w > 3 and (dx == 0 or dx == bar_w - 1):
+                    continue
+                if top <= y_up < bottom:
+                    _safe(stdscr, y_up, cx, ch, attr)
+                if top <= y_down < bottom:
+                    _safe(stdscr, y_down, cx, ch, attr)
+
+    # Peak hold dots (mirrored)
+    if peak_heights is not None and ce:
+        for i in range(num_bands):
+            peak_h = int(peak_heights[i] * half_height)
+            if peak_h > 0:
+                y_up = center_y - 1 - peak_h
+                y_down = center_y + peak_h
+                px = x_off + i * (bar_w + gap) + mid_w
+                if px < right:
+                    peak_attr = curses.color_pair(8) | curses.A_BOLD
+                    if top <= y_up < bottom:
+                        _safe(stdscr, y_up, px, "·", peak_attr)
+                    if top <= y_down < bottom:
+                        _safe(stdscr, y_down, px, "·", peak_attr)
+
+
+def _draw_wave(stdscr, audio_buf, top, bottom, left, right, ce, beat_flash=0):
+    """Draw audio waveform using line-drawing characters."""
+    h = bottom - top
+    w = right - left
+    if h < 3 or w < 3 or audio_buf is None:
+        return
+
+    center = top + h // 2
+    buf_len = len(audio_buf)
+    step = max(1, buf_len // w)
+
+    prev_y = None
+    for col in range(w):
+        idx = min(col * step, buf_len - 1)
+        val = audio_buf[idx]
+        amp = min(abs(val) * 3, 1.0)
+
+        y = center - int(val * (h // 2) * 0.8)
+        y = max(top, min(bottom - 1, y))
+
+        if ce:
+            pair = min(int(amp * 8), 7) + 1
+        else:
+            pair = 0
+
+        attr = curses.color_pair(pair) if ce else 0
+        if beat_flash > 0 or amp > 0.7:
+            attr |= curses.A_BOLD
+
+        x = left + col
+
+        if prev_y is not None:
+            dy = y - prev_y
+            if dy == 0:
+                ch = "─"
+            elif dy < -1:
+                ch = "╱"
+            elif dy > 1:
+                ch = "╲"
+            elif dy == -1:
+                ch = "╱"
+            else:
+                ch = "╲"
+            # Fill vertical gaps between consecutive points
+            if abs(y - prev_y) > 1:
+                step_y = 1 if y > prev_y else -1
+                for fy in range(prev_y + step_y, y, step_y):
+                    if top <= fy < bottom:
+                        _safe(stdscr, fy, x, "│", attr)
+        else:
+            ch = "─"
+
+        if top <= y < bottom:
+            _safe(stdscr, y, x, ch, attr)
+
+        prev_y = y
+
+
+def _draw_spectrogram(stdscr, spec_history, num_bands, top, bottom,
+                      left, right, ce, beat_flash=0):
+    """Draw scrolling spectrogram heat map."""
+    h = bottom - top
+    w = right - left
+    if h < 3 or w < 3 or not spec_history:
+        return
+
+    SPEC_CHARS = " ·░▒▓█"
+    n_rows = min(num_bands, h)
+
+    for col_idx, col_data in enumerate(spec_history):
+        x = left + col_idx
+        if x >= right:
+            break
+
+        n_data = len(col_data)
+        for row in range(n_rows):
+            y = bottom - 1 - row
+            if y < top:
+                break
+
+            band_idx = min(int(row * n_data / n_rows), n_data - 1)
+            val = min(col_data[band_idx], 1.0)
+
+            ci = min(int(val * (len(SPEC_CHARS) - 1)), len(SPEC_CHARS) - 1)
+            ch = SPEC_CHARS[ci]
+
+            if ch == " ":
+                continue
+
+            if ce:
+                pair = min(int(val * 8), 7) + 1
+            else:
+                pair = 0
+
+            attr = curses.color_pair(pair) if ce else 0
+            if beat_flash > 0:
+                attr |= curses.A_BOLD
+            _safe(stdscr, y, x, ch, attr)
+
+
+def _draw_particles(stdscr, particles, top, bottom, left, right, ce):
+    """Draw active particles as overlay."""
+    for p in particles:
+        x = int(round(p["x"]))
+        y = int(round(p["y"]))
+        if x < left or x >= right or y < top or y >= bottom:
+            continue
+        if p["life"] <= 0:
+            continue
+        attr = curses.color_pair(p["color_pair"]) if ce else 0
+        if p["life"] < p["max_life"] * 0.3:
+            attr |= curses.A_DIM
+        else:
+            attr |= curses.A_BOLD
+        _safe(stdscr, y, x, p["char"], attr)
 
 
 def _draw_separator(stdscr, y, w, ce):
@@ -384,7 +639,10 @@ def _draw_separator(stdscr, y, w, ce):
           curses.color_pair(11) | curses.A_DIM if ce else curses.A_DIM)
 
 
-def draw(stdscr, bars, spotify_poller, ce):
+def draw(stdscr, bars, spotify_poller, ce, no_footer=False,
+         viz_mode=0, beat_flash=0, peak_heights=None,
+         particles=None, spec_history=None, mode_label_timer=0,
+         audio_buf=None):
     h, w = stdscr.getmaxyx()
     stdscr.erase()
 
@@ -392,17 +650,40 @@ def draw(stdscr, bars, spotify_poller, ce):
     if num_bands == 0 or w < 4 or h < 6:
         return
 
-    has_track = spotify_poller and spotify_poller.track_name
-    has_progress = spotify_poller and spotify_poller.duration_ms > 0
+    has_track = not no_footer and spotify_poller and spotify_poller.track_name
+    has_progress = not no_footer and spotify_poller and spotify_poller.duration_ms > 0
     footer_h = 2 if (has_track or has_progress) else 0
 
     bar_top = 0
     bar_bot = h - footer_h
     bar_height = bar_bot - bar_top
 
-    # 1. Draw frequency bars across full width
-    _draw_bars(stdscr, bars, num_bands, bar_top, bar_bot, 1, w - 1,
-               bar_height, ce)
+    # Dispatch visualization mode
+    if viz_mode == 1:
+        _draw_mirror(stdscr, bars, num_bands, bar_top, bar_bot, 1, w - 1,
+                     bar_height, ce, beat_flash, peak_heights)
+    elif viz_mode == 2:
+        _draw_wave(stdscr, audio_buf, bar_top, bar_bot, 1, w - 1,
+                   ce, beat_flash)
+    elif viz_mode == 3:
+        _draw_spectrogram(stdscr, spec_history, num_bands, bar_top, bar_bot,
+                          1, w - 1, ce, beat_flash)
+    else:
+        _draw_bars(stdscr, bars, num_bands, bar_top, bar_bot, 1, w - 1,
+                   bar_height, ce, beat_flash, peak_heights)
+
+    # Particles overlay (skip in spectrogram mode)
+    if viz_mode != 3 and particles:
+        _draw_particles(stdscr, particles, bar_top, bar_bot, 1, w - 1, ce)
+
+    # Mode label overlay
+    if mode_label_timer > 0 and 0 <= viz_mode < len(MODE_NAMES):
+        label = f"✦ {MODE_NAMES[viz_mode]}"
+        lx = max(1, (w - len(label)) // 2)
+        ly = max(0, bar_top + 1)
+        if ly < bar_bot:
+            _safe(stdscr, ly, lx, label,
+                  curses.color_pair(12) | curses.A_BOLD if ce else curses.A_BOLD)
 
     # 2. Footer: separator + track info & progress
     if footer_h > 0:
@@ -492,42 +773,87 @@ def main(stdscr, args):
     running_peak = 1.0
     cached_art_url = ""
 
+    # Visual feature state
+    viz_mode = 0
+    mode_label_timer = 0
+    beat_flash = 0
+    bass_avg = 0.0
+    peak_heights = None
+    peak_timers = None
+    particles = []
+    spec_history = deque(maxlen=200)
+    current_rgb = list(GALAXY_FULL_RGB)
+    old_rgb = list(GALAXY_FULL_RGB)
+    target_rgb = list(GALAXY_FULL_RGB)
+    palette_progress = 1.0
+
     try:
         while True:
             key = stdscr.getch()
             if key in (ord("q"), ord("Q"), 27):
                 break
+            if key in (ord("m"), ord("M")):
+                viz_mode = (viz_mode + 1) % 4
+                mode_label_timer = 20
 
             h, w = stdscr.getmaxyx()
             num_bands = args.bars if args.bars else max(8, min(64, (w - 4) // 3))
 
             if prev_bars is None or len(prev_bars) != num_bands:
                 prev_bars = np.zeros(num_bands)
+                peak_heights = np.zeros(num_bands)
+                peak_timers = np.zeros(num_bands)
 
-            # Update bar colors from album art palette
+            # Resize spectrogram history deque on terminal width change
+            desired_maxlen = max(10, w - 2)
+            if spec_history.maxlen != desired_maxlen:
+                spec_history = deque(spec_history, maxlen=desired_maxlen)
+
+            # Smooth palette transitions
             if spotify_poller and HAS_PIL and ce:
                 art_url, art_data = spotify_poller.album_art
                 if art_url != cached_art_url:
                     cached_art_url = art_url
                     palette = extract_palette(art_data, 8) if art_data else None
-                    colors = palette if palette else GALAXY_GRADIENT
-                    for i, c in enumerate(colors):
-                        curses.init_pair(i + 1, c, -1)
-                    # Theme UI text to match album palette
                     if palette:
-                        curses.init_pair(10, palette[-2], -1)
-                        curses.init_pair(11, palette[2], -1)
-                        curses.init_pair(12, palette[-1], -1)
-                        curses.init_pair(13, palette[-3], -1)
+                        new_target = [_256_to_rgb(c) for c in palette]
+                        new_target += [_256_to_rgb(palette[-2]),
+                                       _256_to_rgb(palette[2]),
+                                       _256_to_rgb(palette[-1]),
+                                       _256_to_rgb(palette[-3])]
                     else:
-                        curses.init_pair(10, 51, -1)
-                        curses.init_pair(11, 99, -1)
-                        curses.init_pair(12, 213, -1)
-                        curses.init_pair(13, 51, -1)
+                        new_target = list(GALAXY_FULL_RGB)
+                    old_rgb = list(current_rgb)
+                    target_rgb = new_target
+                    palette_progress = 0.0
 
+            if palette_progress < 1.0 and ce:
+                palette_progress = min(palette_progress + 0.03, 1.0)
+                current_rgb = _lerp_palette(old_rgb, target_rgb, palette_progress)
+
+            # Paused: decay bars/peaks, update particles, draw, continue
             if spotify_poller and not spotify_poller.is_playing:
                 prev_bars *= 0.8
-                draw(stdscr, prev_bars, spotify_poller, ce)
+                if peak_heights is not None:
+                    peak_heights *= 0.92
+                # Let particles fade out
+                new_particles = []
+                for p in particles:
+                    p["y"] -= p["vy"]
+                    p["x"] += p["vx"]
+                    p["life"] -= 1
+                    if p["life"] > 0:
+                        new_particles.append(p)
+                particles = new_particles
+                draw(stdscr, prev_bars, spotify_poller, ce, args.no_footer,
+                     viz_mode=viz_mode, beat_flash=beat_flash,
+                     peak_heights=peak_heights, particles=particles,
+                     spec_history=spec_history,
+                     mode_label_timer=mode_label_timer)
+                if beat_flash > 0:
+                    beat_flash -= 1
+                if mode_label_timer > 0:
+                    mode_label_timer -= 1
                 continue
 
             audio = capture.get_buffer()
@@ -549,7 +875,109 @@ def main(stdscr, args):
             )
 
             prev_bars = smoothed
-            draw(stdscr, smoothed, spotify_poller, ce)
+
+            # Beat detection — bass energy from first 3 bands
+            bass_energy = float(np.mean(smoothed[:min(3, num_bands)]))
+            bass_avg = bass_avg * 0.9 + bass_energy * 0.1
+            beat_triggered = bass_energy > bass_avg * 1.6 and bass_energy > 0.05
+            if beat_triggered:
+                beat_flash = 4
+
+            # Peak hold update
+            for i in range(num_bands):
+                if smoothed[i] > peak_heights[i]:
+                    peak_heights[i] = smoothed[i]
+                    peak_timers[i] = 20
+                else:
+                    peak_timers[i] -= 1
+                    if peak_timers[i] <= 0:
+                        peak_heights[i] *= 0.92
+
+            # Append to spectrogram history
+            if viz_mode == 3:
+                spec_history.append(smoothed.copy())
+
+            # Particle spawn & physics
+            has_track_info = (not args.no_footer and spotify_poller
+                              and spotify_poller.track_name)
+            has_progress_info = (not args.no_footer and spotify_poller
+                                 and spotify_poller.duration_ms > 0)
+            footer_h = 2 if (has_track_info or has_progress_info) else 0
+            bar_bot = h - footer_h
+            bar_height_calc = bar_bot  # bar_top is 0
+
+            if viz_mode != 3 and bar_height_calc > 2:
+                total = (w - 1) - 1
+                bar_w_calc = max(1, (total - (num_bands - 1)) // num_bands)
+                gap_calc = 1
+                used_calc = num_bands * bar_w_calc + (num_bands - 1) * gap_calc
+                x_off_calc = 1 + max(0, (total - used_calc) // 2)
+
+                # Spawn particles from bars above 60%
+                for i in range(num_bands):
+                    if (smoothed[i] > 0.6 and random.random() < 0.15
+                            and len(particles) < 80):
+                        bar_h = int(smoothed[i] * bar_height_calc)
+                        px = (x_off_calc + i * (bar_w_calc + gap_calc)
+                              + bar_w_calc // 2)
+                        py = bar_bot - 1 - bar_h
+                        pair = min(int(smoothed[i] * 8), 7) + 1 if ce else 1
+                        particles.append({
+                            "x": float(px), "y": float(py),
+                            "vx": random.uniform(-0.2, 0.2),
+                            "vy": random.uniform(0.3, 0.8),
+                            "char": random.choice(PARTICLE_CHARS),
+                            "life": random.randint(15, 30),
+                            "max_life": 30,
+                            "color_pair": pair,
+                        })
+
+                # Beat-triggered extra particles from loudest bars
+                if beat_triggered:
+                    loudest = np.argsort(smoothed)[-3:]
+                    for idx in loudest:
+                        for _ in range(random.randint(1, 2)):
+                            if len(particles) >= 80:
+                                break
+                            bar_h = int(smoothed[idx] * bar_height_calc)
+                            px = (x_off_calc + idx * (bar_w_calc + gap_calc)
+                                  + bar_w_calc // 2)
+                            py = bar_bot - 1 - bar_h
+                            pair = (min(int(smoothed[idx] * 8), 7) + 1
+                                    if ce else 1)
+                            particles.append({
+                                "x": float(px), "y": float(py),
+                                "vx": random.uniform(-0.3, 0.3),
+                                "vy": random.uniform(0.5, 1.0),
+                                "char": random.choice(PARTICLE_CHARS),
+                                "life": random.randint(20, 35),
+                                "max_life": 35,
+                                "color_pair": pair,
+                            })
+
+            # Update particle physics
+            new_particles = []
+            for p in particles:
+                p["y"] -= p["vy"]
+                p["x"] += p["vx"]
+                p["life"] -= 1
+                if p["life"] > 0:
+                    new_particles.append(p)
+            particles = new_particles
+
+            # Draw current frame
+            draw(stdscr, smoothed, spotify_poller, ce, args.no_footer,
+                 viz_mode=viz_mode, beat_flash=beat_flash,
+                 peak_heights=peak_heights, particles=particles,
+                 spec_history=spec_history,
+                 mode_label_timer=mode_label_timer,
+                 audio_buf=audio)
+
+            # Decrement timers after draw
+            if beat_flash > 0:
+                beat_flash -= 1
+            if mode_label_timer > 0:
+                mode_label_timer -= 1
 
     finally:
         capture.stop()
@@ -571,6 +999,8 @@ def run():
                         help="Fixed number of frequency bars (default: auto)")
     parser.add_argument("--color-off", action="store_true",
                         help="Disable colored output")
+    parser.add_argument("--no-footer", action="store_true",
+                        help="Hide track info and progress bar footer")
     args = parser.parse_args()
 
     if args.list_devices:
@@ -606,7 +1036,7 @@ def run():
         except (ValueError, EOFError):
             pass
 
-    print("Starting visualizer... (press q to quit)")
+    print("Starting visualizer... (press q to quit, m to change mode)")
     if not HAS_PIL:
         print("(pip install Pillow for album art display)")
 
